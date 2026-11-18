@@ -19,14 +19,19 @@ use crate::chunkio;
 use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, Need, Register,
-    RequestJob, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
+    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, LogChunk, MAX_MSG_SIZE, Need,
+    Register, RequestJob, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
     worker_message,
 };
 use crate::sd;
 
 /// nix/flakelet-worker.nix greps the unit's StatusText for this.
 pub const CONNECTED_STATUS: &str = "connected to hub";
+
+/// Heartbeat ticks between notices for builds waiting on a slot. A
+/// lookahead build can wait behind long builds for longer than the
+/// submitter's max-silent-time, which Nix counts from dispatch.
+const WAIT_NOTICE_TICKS: u32 = 10;
 
 pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result<()> {
     let mut endpoint = Endpoint::from_shared(opts.hub.clone())?;
@@ -109,6 +114,7 @@ async fn session_loop(
     // Builds staged to completion but waiting for a free slot.
     let mut ready: VecDeque<String> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    let mut ticks: u32 = 0;
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
     declare_capacity(active, &ready, &env).await?;
     loop {
@@ -127,6 +133,10 @@ async fn session_loop(
                     load1: loadavg1(),
                     resumable_keys: ctx.resumable_keys(),
                 }))).await?;
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(WAIT_NOTICE_TICKS) {
+                    send_wait_notices(active, out_tx).await?;
+                }
                 declare_capacity(active, &ready, &env).await?;
                 continue;
             }
@@ -183,6 +193,24 @@ async fn session_loop(
             }
         }
     }
+}
+
+/// Log a line for each build still without a slot so the submitting
+/// Nix does not kill it as silent before it starts.
+async fn send_wait_notices(
+    active: &HashMap<String, ActiveBuild>,
+    out_tx: &mpsc::Sender<WorkerMessage>,
+) -> Result<()> {
+    let notice = format!("tribuchet: waiting for a free slot on {}\n", hostname());
+    for (id, _) in active.iter().filter(|(_, b)| b.slot.is_none()) {
+        out_tx
+            .send(msg(worker_message::Msg::Log(LogChunk {
+                build_id: id.clone(),
+                data: notice.clone().into_bytes(),
+            })))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Free slots, plus one lookahead build staged while every slot is
